@@ -274,8 +274,8 @@ static int ucs_to_utf8(uint32_t code, char buf[4]);
 // stack overflow during recursive descent of the parser.
 #define BRACKET_LEVEL_MAX 30
 #define BRACE_LEVEL_MAX 30
-#define TABLE_MAX (1 << 14) // 16k
-#define ARRAY_MAX (1 << 14) // 16k
+#define TABLE_MAX (1 << 24) // 16M
+#define ARRAY_MAX (1 << 24) // 16M
 
 // Buffer size for scanning a number or a timestamp. TOML does not limit the
 // length of either literal; tomlc17 does, like the limits above: a literal that

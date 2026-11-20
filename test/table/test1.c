@@ -100,8 +100,35 @@ static void test_large_table_merge() {
   free(doc);
 }
 
+// Tables and arrays hold more than the 16k they once stopped at.
+static void test_past_16k() {
+  printf("Running test_past_16k...\n");
+  const int n = 20000;
+  char *doc = make_doc(n, -1);
+  toml_result_t result = toml_parse(doc, strlen(doc));
+  CHECK(result.ok);
+  CHECK(toml_get(result.toptab, "t").u.tab.size == n);
+  toml_free(result);
+  free(doc);
+
+  doc = malloc((size_t)n * 8 + 16);
+  int len = sprintf(doc, "a = [");
+  for (int i = 0; i < n; i++) {
+    len += sprintf(doc + len, "%d,", i);
+  }
+  len += sprintf(doc + len, "]\n");
+  result = toml_parse(doc, len);
+  CHECK(result.ok);
+  toml_datum_t a = toml_get(result.toptab, "a");
+  CHECK(a.type == TOML_ARRAY && a.u.arr.size == n);
+  CHECK(a.u.arr.elem[n - 1].u.int64 == n - 1);
+  toml_free(result);
+  free(doc);
+}
+
 int main() {
   test_large_table();
+  test_past_16k();
   test_large_table_duplicate();
   test_index_threshold();
   test_large_table_merge();
