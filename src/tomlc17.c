@@ -203,6 +203,7 @@ static char *pool_alloc(pool_t *pool, int n) {
 typedef struct cell_t cell_t;
 struct cell_t {
   uint32_t top, max;
+  void *aux; // a table's key[] cell: its key index, or NULL
   // first byte of data starts here (i.e. &(*this)[1])
 };
 
@@ -217,6 +218,7 @@ static char *cell_realloc(char *p, int size) {
     cell_t *cp = tmp;
     cp->max = size;
     cp->top = size;
+    cp->aux = NULL;
     return (char *)&cp[1];
   }
 
@@ -243,6 +245,9 @@ static char *cell_realloc(char *p, int size) {
 static void cell_free(char *p) {
   if (p) {
     cell_t *cp = (cell_t *)(p - sizeof(cell_t));
+    if (cp->aux) {
+      FREE(cp->aux);
+    }
     FREE(cp);
   }
 }
@@ -387,9 +392,83 @@ struct parser_t {
   ebuf_t ebuf;          // buffer to store last error message
 };
 
+// A table of TAB_INDEX_MIN keys or more finds them through an index: open
+// addressing over key positions + 1 (0 when empty), at most half full, kept
+// in the aux of the table's key[] cell.
+#define TAB_INDEX_MIN 32
+
+typedef struct tabindex_t tabindex_t;
+struct tabindex_t {
+  int cap; // a power of two
+  int slot[];
+};
+
+static uint32_t key_hash(const char *ptr, int len) {
+  uint32_t h = 2166136261u; // FNV-1a
+  for (int i = 0; i < len; i++) {
+    h = (h ^ (uint8_t)ptr[i]) * 16777619u;
+  }
+  return h;
+}
+
+static tabindex_t **tab_index(const toml_datum_t *tab) {
+  return (tabindex_t **)&((cell_t *)((char *)tab->u.tab.key - sizeof(cell_t)))
+      ->aux;
+}
+
+static void tab_index_put(tabindex_t *index, const toml_datum_t *tab, int i) {
+  uint32_t mask = index->cap - 1;
+  uint32_t s = key_hash(tab->u.tab.key[i], tab->u.tab.len[i]) & mask;
+  while (index->slot[s]) {
+    s = (s + 1) & mask;
+  }
+  index->slot[s] = i + 1;
+}
+
+// Index all of tab's keys anew, at most a quarter full. Return 0 on success,
+// -1 if out of memory, leaving the index as it was.
+static int tab_index_build(toml_datum_t *tab) {
+  int cap = TAB_INDEX_MIN * 2;
+  while (cap < tab->u.tab.size * 4) {
+    cap *= 2;
+  }
+  tabindex_t *index = MALLOC(sizeof(*index) + sizeof(int) * cap);
+  if (!index) {
+    return -1;
+  }
+  index->cap = cap;
+  memset(index->slot, 0, sizeof(int) * cap);
+  for (int i = 0; i < tab->u.tab.size; i++) {
+    tab_index_put(index, tab, i);
+  }
+  tabindex_t **at = tab_index(tab);
+  if (*at) {
+    FREE(*at);
+  }
+  *at = index;
+  return 0;
+}
+
+static int tab_index_find(const toml_datum_t *tab, const tabindex_t *index,
+                          const char *ptr, int len) {
+  uint32_t mask = index->cap - 1;
+  for (uint32_t s = key_hash(ptr, len) & mask; index->slot[s];
+       s = (s + 1) & mask) {
+    int i = index->slot[s] - 1;
+    if (tab->u.tab.len[i] == len && 0 == memcmp(tab->u.tab.key[i], ptr, len)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 // Find key in tab and return its index. If not found, return -1.
 static int tab_find(toml_datum_t *tab, span_t key) {
   assert(tab->type == TOML_TABLE);
+  if (tab->u.tab.size >= TAB_INDEX_MIN &&
+      (*tab_index(tab) || 0 == tab_index_build(tab))) {
+    return tab_index_find(tab, *tab_index(tab), key.ptr, key.len);
+  }
   for (int i = 0, top = tab->u.tab.size; i < top; i++) {
     if (tab->u.tab.len[i] == key.len &&
         0 == memcmp(tab->u.tab.key[i], key.ptr, key.len)) {
@@ -456,6 +535,17 @@ static toml_datum_t *tab_emplace(toml_datum_t *tab, span_t key,
   tab->u.tab.key[N] = (char *)key.ptr;
   tab->u.tab.len[N] = key.len;
   tab->u.tab.value[N] = DATUM_ZERO;
+
+  // An index that can't take the key is dropped: lookups go back to scanning
+  tabindex_t **index = tab_index(tab);
+  if (*index) {
+    if ((N + 1) * 2 <= (*index)->cap) {
+      tab_index_put(*index, tab, N);
+    } else if (tab_index_build(tab)) {
+      FREE(*index);
+      *index = NULL;
+    }
+  }
   return &tab->u.tab.value[N];
 }
 
@@ -897,6 +987,11 @@ toml_datum_t toml_get(toml_datum_t datum, const char *key) {
     int n = datum.u.tab.size;
     if (n > 0) {
       int key_len = strlen(key);
+      const tabindex_t *index = *tab_index(&datum);
+      if (index) {
+        int i = tab_index_find(&datum, index, key, key_len);
+        return i >= 0 ? datum.u.tab.value[i] : DATUM_ZERO;
+      }
       const char **pkey = datum.u.tab.key;
       int *plen = datum.u.tab.len;
       toml_datum_t *pvalue = datum.u.tab.value;
